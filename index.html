@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SleepThera — R&D Preview</title>
+  <link rel="stylesheet" as="style"
+        href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+  <header class="topbar">
+    <div id="bell-logo" class="bell-badge" title="SleepThera">B</div>
+    <span class="brand-label">SleepThera · R&amp;D Preview</span>
+    <span id="demo-pill" class="demo-pill" hidden>DEMO</span>
+  </header>
+
+  <div id="asset-banner" class="asset-banner" hidden></div>
+
+  <main>
+
+    <!-- Intro -->
+    <section id="screen-intro" class="screen card intro">
+      <div class="bell-badge large">B</div>
+      <h1>SleepThera</h1>
+      <p class="subtitle">30초 호흡으로 시작하는 수면 케어</p>
+      <button id="btn-start" class="primary big">측정 시작</button>
+      <p id="intro-err" class="error" hidden></p>
+      <p class="privacy">
+        카메라로 약 45초간 자율신경 상태를 측정합니다.<br/>
+        모든 데이터는 기기 외부로 전송되지 않습니다.
+      </p>
+    </section>
+
+    <!-- Capture (preflight runs in the same screen so the video never blinks) -->
+    <section id="screen-capture" class="screen" hidden>
+      <div class="capture-grid">
+        <div class="video-stage">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="face-overlay" class="face-overlay"></canvas>
+          <canvas id="roi-canvas" hidden></canvas>
+          <div id="face-hint" class="face-hint">화면 안에 얼굴을 위치해주세요</div>
+        </div>
+        <aside id="capture-sidebar" class="capture-side" hidden>
+          <div class="sqi-ring-wrap">
+            <div class="sqi-ring">
+              <svg viewBox="0 0 120 120">
+                <circle class="ring-bg" cx="60" cy="60" r="52"
+                        fill="none" stroke-width="8" />
+                <circle id="ring-fg" class="ring-fg" cx="60" cy="60" r="52"
+                        fill="none" stroke-width="8" stroke-linecap="round"
+                        stroke-dasharray="326.7" stroke-dashoffset="326.7" />
+              </svg>
+              <div class="sqi-ring-center">
+                <div class="hr-num" id="hr-ring">—</div>
+                <div class="hr-unit">bpm</div>
+              </div>
+            </div>
+            <div class="sqi-label">
+              <div class="kor">신호 품질</div>
+              <div class="pct" id="sqi-pct">—</div>
+            </div>
+          </div>
+          <div class="countdown-card">
+            <div class="num" id="countdown">45</div>
+            <div class="lbl">남은 시간 (초)</div>
+          </div>
+        </aside>
+      </div>
+
+      <!-- Phase 6: 3-second environmental gate, shown inline during the first 3s -->
+      <section id="preflight-panel" class="preflight-panel">
+        <h2 class="preflight-title">측정 환경 확인 중</h2>
+        <p class="preflight-sub">3초 동안 조명·프레임·자세를 점검합니다.</p>
+        <ul id="preflight-checks" class="preflight-checks"></ul>
+        <div id="preflight-retry-row" class="preflight-actions" hidden>
+          <button id="btn-preflight-retry" class="primary">다시 시도</button>
+          <button id="btn-preflight-skip" class="secondary">그대로 진행</button>
+        </div>
+      </section>
+
+      <!-- Phase 5: real POS-derived BVP, scrolling single trace -->
+      <section id="trace-panel" class="hrv-trace-panel" hidden>
+        <header class="trace-header">
+          <span class="trace-label">실시간 rPPG 파형</span>
+          <span id="trace-mode" class="trace-mode" data-mode="preview">preview</span>
+          <span class="trace-bpm"><span id="bpm-value">--</span> <small>BPM</small></span>
+        </header>
+        <canvas id="hrv-canvas"></canvas>
+        <footer class="trace-legend">
+          <span class="legend-dot" style="background:var(--st-trace-ppg)"></span>
+          POS-derived BVP · 0.7–4 Hz 대역
+        </footer>
+      </section>
+
+      <div class="capture-actions">
+        <button id="btn-cancel" class="secondary">측정 중단</button>
+      </div>
+    </section>
+    <!-- /screen-capture -->
+
+    <!-- Result -->
+    <section id="screen-result" class="screen" hidden>
+      <div class="card">
+        <div class="result-hero">
+          <div>
+            <div class="ans-gauge" id="ans-gauge">
+              <span class="ans-axis-label top">고각성</span>
+              <span class="ans-axis-label bottom">저각성</span>
+              <span class="ans-axis-label left">교감</span>
+              <span class="ans-axis-label right">부교감</span>
+              <svg viewBox="0 0 280 280">
+                <defs>
+                  <filter id="gauge-glow" x="-50%" y="-50%" width="200%" height="200%">
+                    <feGaussianBlur stdDeviation="4" result="blur"/>
+                    <feMerge>
+                      <feMergeNode in="blur"/>
+                      <feMergeNode in="SourceGraphic"/>
+                    </feMerge>
+                  </filter>
+                  <linearGradient id="gauge-bg" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0%"   stop-color="var(--st-danger)"  stop-opacity="0.08"/>
+                    <stop offset="50%"  stop-color="var(--st-primary)" stop-opacity="0.04"/>
+                    <stop offset="100%" stop-color="var(--st-success)" stop-opacity="0.08"/>
+                  </linearGradient>
+                </defs>
+                <rect x="0" y="0" width="280" height="280" rx="16" fill="url(#gauge-bg)"/>
+                <g stroke="var(--st-border-subtle)" stroke-width="1" fill="none">
+                  <line x1="140" y1="20" x2="140" y2="260"/>
+                  <line x1="20"  y1="140" x2="260" y2="140"/>
+                  <line x1="80"  y1="20" x2="80"  y2="260" stroke-dasharray="2 4"/>
+                  <line x1="200" y1="20" x2="200" y2="260" stroke-dasharray="2 4"/>
+                  <line x1="20"  y1="80"  x2="260" y2="80"  stroke-dasharray="2 4"/>
+                  <line x1="20"  y1="200" x2="260" y2="200" stroke-dasharray="2 4"/>
+                </g>
+                <ellipse cx="140" cy="140" rx="60" ry="60"
+                         fill="none" stroke="var(--st-text-tertiary)"
+                         stroke-width="1" stroke-dasharray="4 4"/>
+                <circle id="gauge-point" cx="140" cy="140" r="6"
+                        fill="var(--st-primary)" filter="url(#gauge-glow)"
+                        opacity="0"/>
+              </svg>
+            </div>
+          </div>
+          <div class="ans-summary">
+            <span id="ans-badge" class="ans-state-badge">
+              <span class="dot"></span><span id="ans-label">—</span>
+            </span>
+            <p id="quality-chip" class="quality-chip" hidden></p>
+            <p id="ans-interpretation" class="ans-interpretation">—</p>
+            <table class="metrics-table">
+              <tr><th>심박수</th><td><span id="m-hr">—</span> bpm</td></tr>
+              <tr><th>RMSSD</th><td><span id="m-rmssd">—</span> ms</td></tr>
+              <tr><th>SDNN</th><td><span id="m-sdnn">—</span> ms</td></tr>
+              <tr><th>SD1 / SD2</th><td><span id="m-sd1">—</span> / <span id="m-sd2">—</span> ms</td></tr>
+              <tr><th>신호 품질</th><td><span id="m-sqi">—</span></td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <details id="roi-breakdown" class="roi-breakdown" hidden>
+        <summary>측정 영역별 신호 품질</summary>
+        <div id="roi-breakdown-body" class="roi-grid"></div>
+      </details>
+
+      <div id="rationale" class="rationale-card" hidden>
+        <div class="rationale-title">처방 근거 · Why this sound</div>
+        <div class="rationale-flow">
+          <div class="rationale-col">
+            <h4>HRV 측정</h4>
+            <div class="value"><span id="r-hr">—</span><span class="sub"> bpm</span></div>
+            <div class="sub">RMSSD <span id="r-rmssd">—</span> ms</div>
+            <canvas id="r-spark" class="sparkline" width="200" height="40"></canvas>
+          </div>
+          <div class="chevron">›</div>
+          <div class="rationale-col">
+            <h4>자율신경 상태</h4>
+            <span id="r-ans-badge" class="ans-state-badge">
+              <span class="dot"></span><span id="r-ans-label">—</span>
+            </span>
+            <div id="r-rationale" class="sub">—</div>
+          </div>
+          <div class="chevron">›</div>
+          <div class="rationale-col">
+            <h4>사운드 파라미터</h4>
+            <div class="value" id="r-profile">—</div>
+            <div class="badge-row">
+              <span class="param-chip">호흡 빈도 <strong id="r-tempo">—</strong> /분</span>
+              <span class="param-chip">음색 <strong id="r-carrier">—</strong> Hz</span>
+              <span class="param-chip">잔향 <strong id="r-binaural">—</strong> %</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="fallback" class="fallback" hidden>
+        <p>신호 품질이 낮아 자동 분류가 어렵습니다. 지금 어떤 상태에 가장 가깝나요?</p>
+        <div class="fallback-grid">
+          <button data-state="sympathetic_dominant">긴장돼요</button>
+          <button data-state="balanced">평온해요</button>
+          <button data-state="low_arousal">피곤해요</button>
+          <button data-state="vagal_dominant">활기차요</button>
+        </div>
+      </div>
+
+      <div style="text-align:center; margin-top: 24px;">
+        <button id="btn-sound" class="primary big">오늘의 사운드 듣기</button>
+        <button id="btn-retry" class="secondary" style="margin-left: 8px;">다시 측정하기</button>
+      </div>
+    </section>
+
+    <!-- Sound playback -->
+    <section id="screen-sound" class="screen card sound-screen" hidden>
+      <div class="breathing-stage">
+        <div id="breathing-orb" class="breathing-orb"></div>
+        <div id="breathing-text" class="breathing-text">시작합니다</div>
+      </div>
+      <canvas id="audio-vis"></canvas>
+      <div class="sound-meta">
+        <span id="sound-state-label">—</span>
+        <span>·</span>
+        <span id="sound-profile-name">—</span>
+        <span>·</span>
+        <span class="timer" id="sound-timer">01:00</span>
+      </div>
+      <div class="feedback-row" id="feedback-row" hidden>
+        <button class="chip fb" data-fb="good">좋음</button>
+        <button class="chip fb" data-fb="ok">보통</button>
+        <button class="chip fb" data-fb="bad">별로</button>
+      </div>
+      <div style="margin-top: 32px;">
+        <button id="btn-finish" class="secondary" hidden>다시 측정하기</button>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <footer>Internal R&amp;D — not a medical device</footer>
+
+  <!-- file:// origin guard — ES modules require http(s)://. If the user opens
+       index.html by double-clicking, browsers silently block imports and the
+       JS never runs (palette still loads). Detect and surface this loudly. -->
+  <script>
+    (function () {
+      if (location.protocol === 'file:') {
+        document.addEventListener('DOMContentLoaded', () => {
+          const b = document.getElementById('asset-banner');
+          if (b) {
+            b.hidden = false;
+            b.textContent = '⚠ file:// 에서는 모듈이 로드되지 않습니다. BELL-HRV-PoC.command 로 실행하거나 http://localhost:8000/frontend/ 로 열어주세요.';
+          }
+        });
+      }
+    })();
+  </script>
+
+  <!-- MediaPipe Face Mesh (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+  <!-- Phase 6: cache-bust to defeat stale modules. Bump on each pipeline edit.
+       v=6.4-pages: API_BASE auto-skipped on non-local hosts (GitHub Pages deploy). -->
+  <script type="module" src="./main.js?v=6.4-pages"></script>
+</body>
+</html>
