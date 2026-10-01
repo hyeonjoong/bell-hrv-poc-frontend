@@ -10,9 +10,28 @@
  * The observer is fed from onFaceResults during the preflight phase. The
  * canvas+ctx are passed in so we don't allocate per call; we draw a tiny
  * patch and read pixels.
+ *
+ * Frame rate (v6.5): minFps applies to the camera frame rate, counted from
+ * the distinct camera frames main.js reports through noteCameraFrame (with
+ * requestVideoFrameCallback presentedFrames when available). FaceMesh may
+ * analyse fewer frames than the camera delivers; LiveRPPG resamples to
+ * 30 Hz, and the rPPG tests show the HR stays within 2 bpm from 15 analysed
+ * frames per second, so the analysis rate only has to reach minProcessedFps.
+ * Without camera frame notes the analysis rate is used for both. Below
+ * minHrFps (MIN_SOURCE_FPS in rppg_live.js) no HR is computed at all, and the
+ * hint says so.
+ *
+ * Window: the 3 s window starts at the first analysed frame, and camera frame
+ * notes from before it are ignored. A gap of more than maxGapMs between two
+ * analysed frames (a slow first FaceMesh call while the model loads, a busy
+ * main thread, a face lost for a while) starts the window again, at most
+ * maxRestarts times per run, so the frame-rate check measures the device and
+ * not a one-off stall. main.js also restarts it at the first FaceMesh result.
  */
 export const PREFLIGHT_THRESHOLDS = {
   minFps: 28,
+  minProcessedFps: 15,
+  minHrFps: 7,
   faceBrightMin: 70,
   faceBrightMax: 210,
   faceSpatialStdMax: 38,
@@ -21,26 +40,46 @@ export const PREFLIGHT_THRESHOLDS = {
 };
 
 export class Preflight {
-  constructor(durationMs = 3000) {
+  constructor(durationMs = 3000, { maxGapMs = 1000, maxRestarts = 3 } = {}) {
     this.durationMs = durationMs;
+    this.maxGapMs = maxGapMs;
+    this.maxRestarts = maxRestarts;
     this.startMs = null;
     this.frames = [];
     this.done = false;
     this.result = null;
-    this._scratch = document.createElement('canvas');
+    this.cameraFrames = [];
+    this.restarts = 0;
+    // Scratch canvases are created on first use (fixed sizes, never resized).
+    this._faceCtx = null;
+    this._bgCtx = null;
   }
 
   start() {
     this.startMs = null;
     this.frames = [];
+    this.cameraFrames = [];
+    this.restarts = 0;
     this.done = false;
     this.result = null;
+  }
+
+  /** One call per distinct camera frame (analysed or not). */
+  noteCameraFrame(tMs, presentedFrames) {
+    if (this.done || !Number.isFinite(tMs)) return;
+    this.cameraFrames.push({ t: tMs, n: Number.isFinite(presentedFrames) ? presentedFrames : null });
+  }
+
+  _scratchCtx(size) {
+    const c = document.createElement('canvas');
+    c.width = size;
+    c.height = size;
+    return c.getContext('2d', { willReadFrequently: true });
   }
 
   /** Called from onFaceResults with the multi-ROI boxes. */
   observe(boxes, w, h, video, tMs) {
     if (this.done) return;
-    if (this.startMs == null) this.startMs = tMs;
     const all = Object.values(boxes);
     if (!all.length) return;
 
@@ -53,9 +92,8 @@ export class Preflight {
 
     // Downsample face to 32×32 for luma stats — fast and stable.
     const FS = 32;
-    this._scratch.width = FS;
-    this._scratch.height = FS;
-    const ctx = this._scratch.getContext('2d', { willReadFrequently: true });
+    if (!this._faceCtx) this._faceCtx = this._scratchCtx(FS);
+    const ctx = this._faceCtx;
     ctx.drawImage(video, fx0, fy0, fw, fh, 0, 0, FS, FS);
     const fd = ctx.getImageData(0, 0, FS, FS).data;
     let fs1 = 0, fs2 = 0, fn = 0;
@@ -72,12 +110,12 @@ export class Preflight {
       [0, 0], [w - BP, 0],
       [0, h - BP], [w - BP, h - BP],
     ];
-    this._scratch.width = BP;
-    this._scratch.height = BP;
+    if (!this._bgCtx) this._bgCtx = this._scratchCtx(BP);
+    const bctx = this._bgCtx;
     let bgSum = 0, bgN = 0;
     for (const [bx, by] of corners) {
-      ctx.drawImage(video, bx, by, BP, BP, 0, 0, BP, BP);
-      const bd = ctx.getImageData(0, 0, BP, BP).data;
+      bctx.drawImage(video, bx, by, BP, BP, 0, 0, BP, BP);
+      const bd = bctx.getImageData(0, 0, BP, BP).data;
       for (let i = 0; i < bd.length; i += 4) {
         const Y = 0.299 * bd[i] + 0.587 * bd[i + 1] + 0.114 * bd[i + 2];
         bgSum += Y; bgN++;
@@ -87,9 +125,26 @@ export class Preflight {
 
     const cx = fx0 + fw / 2;
     const cy = fy0 + fh / 2;
-    this.frames.push({ t: tMs, faceMean, faceStd, bgMean, cx, cy });
+    this._record({ t: tMs, faceMean, faceStd, bgMean, cx, cy });
+  }
 
-    if (tMs - this.startMs >= this.durationMs && this.frames.length >= 30) {
+  /** Adds one analysed frame's measurements (observe() without the pixel
+   *  work; also used by the Node tests). Handles the window start, the
+   *  restart after a gap and the end of the check. */
+  _record(frame) {
+    if (this.done || !Number.isFinite(frame.t)) return;
+    const prev = this.frames[this.frames.length - 1];
+    if (prev && frame.t - prev.t > this.maxGapMs && this.restarts < this.maxRestarts) {
+      this.restarts++;
+      this.frames = [];
+      this.startMs = null;
+    }
+    if (this.startMs == null) {
+      this.startMs = frame.t;
+      this.cameraFrames = this.cameraFrames.filter((c) => c.t >= frame.t);
+    }
+    this.frames.push(frame);
+    if (frame.t - this.startMs >= this.durationMs && this.frames.length >= 30) {
       this.done = true;
       this.result = this._evaluate();
     }
@@ -98,7 +153,9 @@ export class Preflight {
   _evaluate() {
     const f = this.frames;
     const T = Math.max(0.001, (f[f.length - 1].t - f[0].t) / 1000);
-    const fps = (f.length - 1) / T;
+    const processedFps = (f.length - 1) / T;
+    const cameraFps = this._cameraFps() ?? processedFps;
+    const fps = cameraFps;
     const avg = (sel) => f.reduce((s, x) => s + sel(x), 0) / f.length;
     const faceB = avg((x) => x.faceMean);
     const faceStd = avg((x) => x.faceStd);
@@ -116,10 +173,16 @@ export class Preflight {
     const checks = [
       {
         key: 'fps',
-        pass: fps >= t.minFps,
+        pass: cameraFps >= t.minFps && processedFps >= t.minProcessedFps,
         label: '프레임 속도',
-        value: `${fps.toFixed(1)} fps`,
-        hint: '다른 앱을 닫고 다시 시도해주세요.',
+        value: processedFps < cameraFps - 2
+          ? `${cameraFps.toFixed(1)} fps (분석 ${processedFps.toFixed(0)})`
+          : `${cameraFps.toFixed(1)} fps`,
+        hint: processedFps < t.minHrFps
+          ? '분석 속도가 너무 느려 이대로는 심박수를 계산할 수 없습니다. 다른 앱과 브라우저 탭을 닫고 다시 시도해주세요.'
+          : cameraFps >= t.minFps
+            ? '기기의 분석 속도가 느립니다. 다른 앱과 브라우저 탭을 닫고 다시 시도해주세요.'
+            : '다른 앱을 닫고 다시 시도해주세요.',
       },
       {
         key: 'brightness',
@@ -153,6 +216,19 @@ export class Preflight {
       },
     ];
     const allPass = checks.every((c) => c.pass);
-    return { allPass, checks, fps, faceB, faceStd, bgB, jitter };
+    return { allPass, checks, fps, cameraFps, processedFps, faceB, faceStd, bgB, jitter };
+  }
+
+  /** Camera frames per second over the noted frames, or null if too few. */
+  _cameraFps() {
+    const c = this.cameraFrames;
+    if (c.length < 2) return null;
+    const first = c[0], last = c[c.length - 1];
+    const sec = (last.t - first.t) / 1000;
+    if (!(sec > 0)) return null;
+    // presentedFrames counts frames the browser presented, including ones whose
+    // callback was skipped while the main thread was busy.
+    if (first.n != null && last.n != null && last.n > first.n) return (last.n - first.n) / sec;
+    return (c.length - 1) / sec;
   }
 }

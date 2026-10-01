@@ -3,6 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Content Security Policy. MediaPipe needs 'unsafe-eval' (it fails
+       without it). The inline file:// guard below is allowed by its sha256;
+       update the hash when that script changes (npm test checks it). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/ 'wasm-unsafe-eval' 'unsafe-eval' 'sha256-zHbIgJIFkcmAQKti/1aXZkhxXAG4GtFFSrXyiNeQzD4='; connect-src 'self' https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/ http://127.0.0.1:8765; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/; font-src https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/; img-src 'self' data: blob:; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'" />
   <title>SleepThera — R&D Preview</title>
   <link rel="stylesheet" as="style"
         href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css" />
@@ -225,6 +229,12 @@
         <span>·</span>
         <span class="timer" id="sound-timer">01:00</span>
       </div>
+      <div class="sound-controls" id="sound-controls" hidden>
+        <button id="btn-sound-stop" class="secondary">멈춤</button>
+        <label class="volume-control">음량
+          <input id="sound-volume" type="range" min="0" max="0.9" step="0.05" value="0.9" />
+        </label>
+      </div>
       <div class="feedback-row" id="feedback-row" hidden>
         <button class="chip fb" data-fb="good">좋음</button>
         <button class="chip fb" data-fb="ok">보통</button>
@@ -251,19 +261,24 @@
           const b = document.getElementById('asset-banner');
           if (b) {
             b.hidden = false;
-            b.textContent = '⚠ file:// 에서는 모듈이 로드되지 않습니다. BELL-HRV-PoC.command 로 실행하거나 http://localhost:8000/frontend/ 로 열어주세요.';
+            b.textContent = 'file:// 에서는 모듈이 로드되지 않습니다. 이 폴더에서 python3 -m http.server 8000 을 실행한 뒤 http://localhost:8000/ 으로 열어주세요.';
           }
         });
       }
     })();
   </script>
 
-  <!-- MediaPipe Face Mesh (CDN) -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+  <!-- MediaPipe Face Mesh (CDN), pinned version with SRI. main.js locateFile
+       uses the same version for the wasm and model files, which SRI cannot
+       cover. When changing the version, recompute the hash:
+       curl -s <url> | openssl dgst -sha384 -binary | openssl base64 -A -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"
+          integrity="sha384-nKiz5QrpRlMQLw5nrZcprT7N9vmmAcIgV8TuGuep4x91V4JIPsXa+D44Wxj0guoa"
+          crossorigin="anonymous"></script>
 
   <!-- Phase 6: cache-bust to defeat stale modules. Bump on each pipeline edit.
-       v=6.4-pages: API_BASE auto-skipped on non-local hosts (GitHub Pages deploy). -->
-  <script type="module" src="./main.js?v=6.4-pages"></script>
+       v=6.4-pages: API_BASE auto-skipped on non-local hosts (GitHub Pages deploy).
+       v=6.5-pages: one version string for every module import (npm test checks it). -->
+  <script type="module" src="./main.js?v=6.5-pages"></script>
 </body>
 </html>

@@ -14,7 +14,7 @@
  *
  * No external IR file, no Tone.js, no carrier/transition assets.
  */
-import { ANS_TO_SOUND, REQUIRED_ASSETS } from './sound_mapping.js?v=4.2';
+import { ANS_TO_SOUND, REQUIRED_ASSETS } from './sound_mapping.js?v=6.5-pages';
 
 const TOTAL_PLAY_SECONDS = 60;
 const FADE_IN_SEC = 0.6;
@@ -29,8 +29,9 @@ export class BellSoundEngine {
     /** @type {AnalyserNode|null} */ this.analyser = null;
     /** @type {Record<string, AudioBuffer>} */ this.buffers = {};
     this.missing = [];
-    /** @type {{stateGain:GainNode, sources:AudioBufferSourceNode[], stopFlag:boolean, startedAt:number}|null} */
+    /** @type {{stateGain:GainNode, sources:AudioBufferSourceNode[], timers:number[], stopFlag:boolean, startedAt:number}|null} */
     this.active = null;
+    /** @type {Float32Array|null} */ this._analyserBuf = null;
   }
 
   async init() {
@@ -74,6 +75,8 @@ export class BellSoundEngine {
     return buf;
   }
 
+  /** Starts the 60 s session. Resolves to true once playback is scheduled,
+   *  false when the breath recordings are missing (nothing plays). */
   async playForState(ansState, { onBreath, onMissing } = {}) {
     if (!this.ctx) await this.init();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
@@ -82,7 +85,7 @@ export class BellSoundEngine {
     const exhale = this.buffers['breath/exhale.mp3'];
     if (!inhale || !exhale) {
       onMissing?.({ requested: REQUIRED_ASSETS, available: Object.keys(this.buffers) });
-      return;
+      return false;
     }
     this._stopActive(true);
 
@@ -109,7 +112,10 @@ export class BellSoundEngine {
     stateGain.connect(this.master);
 
     const startedAt = this.ctx.currentTime;
-    this.active = { stateGain, sources: [], stopFlag: false, startedAt, filter };
+    // The scheduler below only touches this session, so a session that was
+    // replaced or stopped can never schedule into the next one.
+    const session = { stateGain, sources: [], timers: [], stopFlag: false, startedAt, filter };
+    this.active = session;
 
     const startBpm = cfg.guide_slowing ? 8 : cfg.breath_rate_bpm;
     const endBpm   = cfg.guide_slowing ? 5 : cfg.breath_rate_bpm;
@@ -129,27 +135,28 @@ export class BellSoundEngine {
       inSrc.playbackRate.value = inSrc.buffer.duration / inhaleSec || 1;
       inSrc.connect(filter);
       inSrc.start(when);
-      this.active.sources.push(inSrc);
+      session.sources.push(inSrc);
 
       const exSrc = this.ctx.createBufferSource();
       exSrc.buffer = exhale;
       exSrc.playbackRate.value = exSrc.buffer.duration / exhaleSec || 1;
       exSrc.connect(filter);
       exSrc.start(when + inhaleSec);
-      this.active.sources.push(exSrc);
+      session.sources.push(exSrc);
 
       if (onBreath) {
         const dt1 = Math.max(0, (when - this.ctx.currentTime) * 1000);
         const dt2 = Math.max(0, (when + inhaleSec - this.ctx.currentTime) * 1000);
-        setTimeout(() => onBreath?.({ phase: 'inhale', cycleSec, inhaleSec }), dt1);
-        setTimeout(() => onBreath?.({ phase: 'exhale', cycleSec, inhaleSec }), dt2);
+        const cue = (phase) => () => { if (!session.stopFlag) onBreath?.({ phase, cycleSec, inhaleSec }); };
+        session.timers.push(setTimeout(cue('inhale'), dt1));
+        session.timers.push(setTimeout(cue('exhale'), dt2));
       }
       return cycleSec;
     };
 
     // Rolling scheduler — pre-roll a couple of cycles, then top up as we go.
     const tick = async () => {
-      while (this.active && !this.active.stopFlag && t < endT) {
+      while (!session.stopFlag && t < endT) {
         if (t - this.ctx.currentTime > SCHED_HORIZON_SEC) {
           await new Promise((r) => setTimeout(r, 400));
           continue;
@@ -159,11 +166,14 @@ export class BellSoundEngine {
       }
     };
     tick();
+    return true;
   }
 
   stop({ fadeMs = FADE_OUT_SEC * 1000 } = {}) {
     if (!this.active) return;
     this.active.stopFlag = true;
+    // Pending breath cues would otherwise keep switching the on-screen text.
+    for (const id of this.active.timers || []) clearTimeout(id);
     const g = this.active.stateGain;
     try {
       g.gain.cancelScheduledValues(this.ctx.currentTime);
@@ -190,8 +200,10 @@ export class BellSoundEngine {
 
   getAnalyserData() {
     if (!this.analyser) return null;
-    const buf = new Float32Array(this.analyser.fftSize);
-    this.analyser.getFloatTimeDomainData(buf);
-    return buf;
+    if (!this._analyserBuf || this._analyserBuf.length !== this.analyser.fftSize) {
+      this._analyserBuf = new Float32Array(this.analyser.fftSize);
+    }
+    this.analyser.getFloatTimeDomainData(this._analyserBuf);
+    return this._analyserBuf;
   }
 }

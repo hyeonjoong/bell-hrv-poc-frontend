@@ -1,0 +1,22 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Syntax check of the served modules
+        run: for f in *.js; do node --check "$f" || exit 1; done
+      - name: Tests (DSP, rPPG, preflight, static checks incl. one ?v= string)
+        run: npm test
