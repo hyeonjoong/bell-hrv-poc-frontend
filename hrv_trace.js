@@ -26,6 +26,12 @@ export class HRVTrace {
 
   setBVP(arr) { if (arr && arr.length) this.bvp = arr; }
   setBPM(bpm) { if (Number.isFinite(bpm)) this.bpm = bpm; }
+  /** Forget the shown BPM (signal no longer passes the quality gate). */
+  clearBPM() {
+    this.bpm = null;
+    this.displayedBpm = null;
+    if (this.bpmDisplayEl) this.bpmDisplayEl.textContent = '--';
+  }
   setMode(m) { if (m === 'preview' || m === 'live') this.mode = m; }
   setBPMDisplayEl(el) { this.bpmDisplayEl = el; }
 

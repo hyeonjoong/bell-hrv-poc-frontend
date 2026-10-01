@@ -12,11 +12,11 @@
  *  - els lookups are tolerant of missing ids: a one-time warning is logged
  *    but execution continues so the button handler still attaches.
  */
-import { BellSoundEngine } from './sound.js?v=6.4-pages';
-import { ANS_TO_SOUND, ANS_KOREAN, REQUIRED_ASSETS } from './sound_mapping.js?v=6.4-pages';
-import { HRVTrace } from './hrv_trace.js?v=6.4-pages';
-import { LiveRPPG } from './rppg_live.js?v=6.4-pages';
-import { Preflight } from './preflight.js?v=6.4-pages';
+import { BellSoundEngine } from './sound.js?v=6.5-pages';
+import { ANS_TO_SOUND, ANS_KOREAN, REQUIRED_ASSETS } from './sound_mapping.js?v=6.5-pages';
+import { HRVTrace } from './hrv_trace.js?v=6.5-pages';
+import { LiveRPPG, LiveHrGate, FrameClock, qualityGate } from './rppg_live.js?v=6.5-pages';
+import { Preflight } from './preflight.js?v=6.5-pages';
 
 // iOS Safari hotfix — surface any silent failure as an on-screen red bar so
 // we don't lose context to a backgrounded console. Wired before anything else
@@ -60,7 +60,20 @@ const FACE_LOST_HINT_MS = 1000;
 const FACE_LOST_ABORT_MS = 3000;
 const FACE_LOST_RETICLE_LOST_MS = 200;
 const SQI_RING_CIRC = 2 * Math.PI * 52;
-const SQI_LIVE_THRESHOLD = 0.55;
+const SQI_LIVE_THRESHOLD = 0.55;   // demo mode only (simulated ring)
+const LIVE_WINDOW_SEC = 8;         // live HR window; estimated every LIVE_EVERY_MS
+const LIVE_EVERY_MS = 500;
+const PREFLIGHT_FACE_HINT_MS = 1000;      // results but no face: show the face hint
+const PREFLIGHT_NO_FACE_MS = 8000;        // results but no face: fail the check
+const PREFLIGHT_NO_FRAME_MS = 8000;       // no camera frame reached FaceMesh: camera message
+const PREFLIGHT_MODEL_TIMEOUT_MS = 15000; // frames sent but no FaceMesh result: model message
+const MAX_VOLUME = 0.9;            // BellSoundEngine master level; the slider can only lower it
+const NO_VALUE = '\u2014';         // placeholder already shown for missing values
+
+// MediaPipe Face Mesh, pinned. index.html loads face_mesh.js from the same
+// path with SRI; keep the two in sync.
+const FACE_MESH_VERSION = '0.4.1633559619';
+const FACE_MESH_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@${FACE_MESH_VERSION}/`;
 
 // Phase 6 — multi-ROI landmark indices (MediaPipe Face Mesh 468-point).
 const ROI_FOREHEAD = [10, 67, 297, 332];
@@ -140,6 +153,9 @@ const ELS_BINDINGS = {
   soundStateLabel: 'sound-state-label',
   soundProfileName: 'sound-profile-name',
   soundTimer: 'sound-timer',
+  soundControls: 'sound-controls',
+  btnSoundStop: 'btn-sound-stop',
+  soundVolume: 'sound-volume',
   feedbackRow: 'feedback-row',
   toast: 'toast',
   roiBreakdown: 'roi-breakdown',
@@ -158,9 +174,7 @@ const state = {
   lastBoxes: null,
   captureStartMs: 0,
   lastFaceMs: 0,
-  rafCapture: null,
   cancelled: false,
-  liveHrEMA: null,
   lastFaceBox: null,
   lastSqi: 0,
   bvpForSpark: null,
@@ -172,6 +186,23 @@ const state = {
   engineInitOnce: false,
   soundRaf: null,
   soundTimerStart: 0,
+  // v6.5 run and frame bookkeeping
+  runId: 0,              // bumped on start, cancel and error; stale async work checks it
+  loopGen: 0,            // bumped to stop the current camera frame and UI loops
+  frameT: 0,             // timestamp of the frame being analysed (FrameClock, ms)
+  uiRaf: null,
+  roiCtx: null,          // cached 2D context of the ROI scratch canvas
+  /** @type {LiveHrGate|null} */ liveGate: null,
+  firstResultMs: null,   // first FaceMesh result (face or not) in this preflight
+  faceSeenMs: 0,         // last FaceMesh result with a usable face
+  framesSent: 0,         // frames handed to FaceMesh in this preflight
+  firstSendMs: null,     // when the first of them was sent
+  sendErr: null,         // first FaceMesh send() error
+  preflightStartMs: 0,
+  preflightFail: null,   // 'face' | 'model' | 'camera' while a preflight failure is shown
+  soundPlaying: false,   // playback screen active (starting or playing)
+  soundStopRequested: false,
+  volume: MAX_VOLUME,
 };
 
 // ───────────────────────── helpers ─────────────────────────
@@ -190,8 +221,14 @@ function toast(msg, duration = 2000) {
 function showError(msg) { els.introErr.textContent = msg; els.introErr.hidden = false; }
 function clearError() { els.introErr.hidden = true; els.introErr.textContent = ''; }
 
+// CSS custom properties do not change at run time; read each once.
+const _cssCache = new Map();
 function getCSS(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const hit = _cssCache.get(name);
+  if (hit) return hit;
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  if (v) _cssCache.set(name, v);
+  return v;
 }
 function ansColor(stateName) {
   return getCSS(`--ans-${stateName}`) || '#3D5FE0';
@@ -250,7 +287,7 @@ async function ensureEngineReady() {
         const list = missing.slice(0, 3).join(', ') +
                      (missing.length > 3 ? ` 외 ${missing.length - 3}개` : '');
         els.assetBanner.textContent =
-          `사운드 자산 누락: ${list} — setup_sounds.sh 실행 여부를 확인해주세요. 가용한 톤으로 자동 대체합니다.`;
+          `사운드 파일을 불러오지 못했습니다: ${list}. sounds/breath/*.mp3 파일이 배포되었는지 확인해주세요.`;
       } else if (location.protocol !== 'file:') {
         els.assetBanner.hidden = true;
       }
@@ -370,6 +407,7 @@ async function onStartClicked() {
   console.info('[SleepThera] onStartClicked fired (demoMode=' + state.demoMode + ')');
   traceLog('start clicked');
   clearError();
+  state.runId++;
   if (els.btnStart) els.btnStart.disabled = true;
   try {
     // Audio engine is best-effort — failure here must NOT block measurement.
@@ -387,8 +425,10 @@ async function onStartClicked() {
     const ok = await openCamera();
     traceLog('openCamera returned ' + ok);
     if (!ok) { els.btnStart && (els.btnStart.disabled = false); return; }
+    watchCameraTrack(state.runId);
 
     traceLog('ensureFaceMesh...');
+    if (state.sendErr) resetFaceMesh();   // the last run's model failed: load it again
     if (!ensureFaceMesh()) {
       stopStream();
       els.btnStart && (els.btnStart.disabled = false);
@@ -400,15 +440,14 @@ async function onStartClicked() {
     state.samples = [];
     state.samplesByROI = { forehead: [], l_cheek: [], r_cheek: [] };
     state.lastBoxes = null;
+    state.lastFaceBox = null;
+    state.liveRppg = null;   // no ROI quality colours from the last run during preflight
     state.cancelled = false;
-    state.liveHrEMA = null;
     state.lastSqi = 0;
     state.lastFaceMs = performance.now();
     state.bvpForSpark = null;
     show(els.captureScreen);
-    setRingProgress(0);
-    els.hrRing && (els.hrRing.textContent = '—');
-    els.sqiPct && (els.sqiPct.textContent = '—');
+    clearLiveReadout();
     els.countdown && (els.countdown.textContent = CAPTURE_SECONDS.toFixed(0));
     enterPreflightPhase();
     startCameraLoop();
@@ -422,22 +461,56 @@ async function onStartClicked() {
 }
 
 // ─── Phase 6 helpers (capture flow plumbing) ────────────────────
+// Korean message for a getUserMedia rejection, by DOMException name.
+function cameraErrorMessage(e) {
+  const name = e?.name || '';
+  switch (name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+    case 'SecurityError':
+      return '카메라 권한이 거부되었습니다. 주소창의 카메라 아이콘을 눌러 허용하거나, ' +
+             '아이폰은 설정 > Safari > 카메라에서 허용한 뒤 다시 시도해주세요.';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return '카메라를 찾을 수 없습니다. 카메라가 연결되어 있는지 확인해주세요.';
+    case 'NotReadableError':
+    case 'TrackStartError':
+    case 'AbortError':
+      return '카메라를 시작할 수 없습니다. 다른 앱이나 브라우저 탭이 카메라를 쓰고 있다면 닫고 다시 시도해주세요.';
+    case 'OverconstrainedError':
+      return '이 카메라가 지원하지 않는 설정입니다. 다른 카메라나 브라우저로 다시 시도해주세요.';
+    default:
+      return `카메라를 열지 못했습니다 (${name || e?.message || e}). 다시 시도해주세요.`;
+  }
+}
+
 async function openCamera() {
   if (!navigator.mediaDevices ||
       typeof navigator.mediaDevices.getUserMedia !== 'function') {
-    showError('이 브라우저에서는 카메라 접근이 차단되어 있습니다. ' +
-              'http://localhost:8000/frontend/ 에서 열어주세요.');
+    if (window.isSecureContext === false) {
+      showError('카메라는 HTTPS 또는 localhost 주소에서만 쓸 수 있습니다. ' +
+                '이 폴더에서 python3 -m http.server 8000 을 실행한 뒤 http://localhost:8000/ 으로 열어주세요.');
+    } else {
+      showError('이 브라우저는 카메라 접근(getUserMedia)을 지원하지 않습니다. 최신 Chrome 또는 Safari로 열어주세요.');
+    }
     return false;
   }
   try {
-    state.stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 640 }, height: { ideal: 480 },
-               frameRate: { ideal: 30 } },
-      audio: false,
-    });
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 },
+                 frameRate: { ideal: 30 } },
+        audio: false,
+      });
+    } catch (e) {
+      if (e?.name !== 'OverconstrainedError') throw e;
+      // Retry once without any constraint the camera might reject.
+      console.warn('[openCamera] constraints rejected, retrying with video: true', e);
+      state.stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
   } catch (e) {
     console.error('[openCamera] getUserMedia rejected:', e);
-    showError('카메라 접근이 거부되었어요: ' + (e?.message || e));
+    showError(cameraErrorMessage(e));
     return false;
   }
   if (!els.video) { showError('비디오 엘리먼트가 없습니다.'); return false; }
@@ -454,15 +527,45 @@ function ensureFaceMesh() {
     return false;
   }
   if (state.faceMesh) return true;
-  state.faceMesh = new FaceMesh({
-    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`,
+  const fm = new FaceMesh({
+    locateFile: (f) => `${FACE_MESH_BASE}${f}`,
   });
-  state.faceMesh.setOptions({
+  fm.setOptions({
     maxNumFaces: 1, refineLandmarks: false,
     minDetectionConfidence: 0.5, minTrackingConfidence: 0.5,
   });
-  state.faceMesh.onResults(onFaceResults);
+  // Ignore late results from an instance that resetFaceMesh() replaced.
+  fm.onResults((results) => { if (fm === state.faceMesh) onFaceResults(results); });
+  state.faceMesh = fm;
   return true;
+}
+
+// After a model failure: drop the FaceMesh instance (its send() may never
+// settle) so the next ensureFaceMesh() starts a fresh download.
+function resetFaceMesh() {
+  const fm = state.faceMesh;
+  state.faceMesh = null;
+  state.sendErr = null;
+  if (fm && typeof fm.close === 'function') {
+    try { Promise.resolve(fm.close()).catch(() => {}); } catch (_) {}
+  }
+}
+
+// The camera can go away mid-run (unplugged, revoked, taken by the OS).
+// track.stop() from our own cleanup does not fire 'ended'.
+function watchCameraTrack(runId) {
+  const track = state.stream?.getVideoTracks?.()[0];
+  if (!track) return;
+  track.addEventListener('ended', () => {
+    if (runId !== state.runId) return;
+    console.warn('[camera] video track ended');
+    if (state.phase === 'capturing') {
+      endCaptureWithError('카메라 연결이 끊겨 측정을 종료했습니다.');
+    } else if (state.phase === 'preflight') {
+      abortCapture('카메라 연결이 끊겼습니다.');
+      showError('카메라 연결이 끊겨 측정을 중단했습니다. 카메라를 확인하고 다시 시작해주세요.');
+    }
+  }, { once: true });
 }
 
 function showCaptureChrome(visible) {
@@ -497,7 +600,14 @@ function enterPreflightPhase() {
   state.phase = 'preflight';
   state.preflight = new Preflight(PREFLIGHT_MS);
   state.preflight.start();
+  state.preflightStartMs = performance.now();
+  state.firstResultMs = null;
+  state.faceSeenMs = 0;
+  state.framesSent = 0;
+  state.firstSendMs = null;
+  state.preflightFail = null;
   if (els.preflightRetryRow) els.preflightRetryRow.hidden = true;
+  if (els.btnPreflightSkip) els.btnPreflightSkip.hidden = false;
   renderPreflightChecksPlaceholder();
   showPreflightPanel(true);
   showCaptureChrome(false);
@@ -509,40 +619,186 @@ function pollPreflight() {
     const r = state.preflight.result;
     renderPreflightResult(r);
     if (r.allPass) {
-      setTimeout(() => transitionToCapture(), 600);
+      const runId = state.runId;
+      setTimeout(() => {
+        if (runId === state.runId && state.phase === 'preflight') transitionToCapture();
+      }, 600);
     } else if (els.preflightRetryRow) {
       els.preflightRetryRow.hidden = false;
     }
     return;
   }
+  const fail = preflightFailure(performance.now());
+  if (fail) { showPreflightFailure(fail); return; }
   requestAnimationFrame(pollPreflight);
+}
+
+// Why the preflight cannot finish, or null while it still can.
+//   camera  no frame reached FaceMesh (video not playing)
+//   model   send() threw, or frames were sent but FaceMesh never answered
+//   face    FaceMesh answers but finds no usable face
+function preflightFailure(now) {
+  if (state.sendErr) return 'model';
+  const since = now - state.preflightStartMs;
+  if (state.firstResultMs == null) {
+    if (state.framesSent === 0) return since > PREFLIGHT_NO_FRAME_MS ? 'camera' : null;
+    return now - state.firstSendMs > PREFLIGHT_MODEL_TIMEOUT_MS ? 'model' : null;
+  }
+  const lastFace = Math.max(state.faceSeenMs, state.firstResultMs);
+  return now - lastFace > PREFLIGHT_NO_FACE_MS ? 'face' : null;
+}
+
+const PREFLIGHT_FAILURES = {
+  face: {
+    label: '얼굴 인식',
+    value: '인식 안 됨',
+    hint: '얼굴이 인식되지 않습니다. 화면 중앙에 얼굴을 맞추고 조명을 밝게 해주세요.',
+  },
+  model: {
+    label: '얼굴 인식 모델',
+    value: '불러오기 실패',
+    hint: '얼굴 인식 모델을 불러오지 못했습니다. 네트워크를 확인하고 다시 시도해주세요.',
+  },
+  camera: {
+    label: '카메라 영상',
+    value: '영상 없음',
+    hint: '카메라 영상이 들어오지 않습니다. 카메라를 확인하고 다시 시도해주세요.',
+  },
+};
+
+function showPreflightFailure(kind) {
+  state.preflightFail = kind;
+  const f = PREFLIGHT_FAILURES[kind];
+  if (els.preflightChecks) {
+    els.preflightChecks.innerHTML = `
+    <li data-state="fail">
+      <span class="check-icon"></span>
+      <span class="check-label">${f.label}</span>
+      <span class="check-value">${f.value}</span>
+      <span class="check-hint">${f.hint}</span>
+    </li>`;
+  }
+  // Capture would stop on face loss anyway, so only offer a retry.
+  if (els.btnPreflightSkip) els.btnPreflightSkip.hidden = true;
+  if (els.preflightRetryRow) els.preflightRetryRow.hidden = false;
+}
+
+function retryPreflight() {
+  if (els.preflightRetryRow) els.preflightRetryRow.hidden = true;
+  const kind = state.preflightFail;
+  if (kind === 'model' || kind === 'camera') {
+    if (kind === 'model') resetFaceMesh();
+    if (!ensureFaceMesh()) {
+      abortCapture('얼굴 인식 모듈을 불러오지 못했습니다.');
+      return;
+    }
+    const playing = els.video?.play?.();
+    if (playing && playing.catch) playing.catch(() => {});
+    enterPreflightPhase();
+    startCameraLoop();   // the old loop may be stuck in a send() that never settles
+  } else {
+    enterPreflightPhase();
+  }
+  pollPreflight();
+}
+
+// A hidden tab gets no camera frame callbacks and no animation frames, so the
+// preflight timers and its frame-rate check would judge the pause, not the
+// camera. Start the check again when the page is visible again.
+function onVisibilityChange() {
+  if (document.visibilityState !== 'visible') return;
+  if (state.cancelled || state.phase !== 'preflight' || state.preflightFail) return;
+  if (state.preflight && state.preflight.done) return;
+  enterPreflightPhase();
 }
 
 function transitionToCapture() {
   if (state.cancelled) return;
+  els.faceHint && els.faceHint.classList.remove('visible');
   showPreflightPanel(false);
   showCaptureChrome(true);
   enterCaptureScreen();
 }
 
+// One FaceMesh send per new camera frame, stamped with the frame's own time.
+// requestVideoFrameCallback (Chrome, Edge, Safari 15.4+) calls back once per
+// presented camera frame with its mediaTime. Without it, a rAF loop sends
+// only when video.currentTime has moved. Either way a fast display (60 or
+// 120 Hz) no longer feeds the same frame several times with different
+// timestamps. Countdown and overlay run in a separate UI loop.
 function startCameraLoop() {
-  if (state.rafCapture) return;
-  const tick = async () => {
-    if (state.cancelled || state.phase === 'idle') {
-      state.rafCapture = null;
-      return;
+  const gen = ++state.loopGen;
+  const video = els.video;
+  const clock = new FrameClock();
+  const alive = () => gen === state.loopGen && !state.cancelled && state.phase !== 'idle';
+
+  const handleFrame = async (mediaMs, presentedFrames) => {
+    const t = clock.next(mediaMs, performance.now());
+    if (state.phase === 'preflight' && state.preflight) {
+      state.preflight.noteCameraFrame(t, presentedFrames);
     }
-    if (state.faceMesh && els.video && els.video.readyState >= 2) {
-      try { await state.faceMesh.send({ image: els.video }); } catch (_) {}
+    const fm = state.faceMesh;
+    if (!fm || !video || video.readyState < 2) return;
+    state.frameT = t;
+    if (state.framesSent++ === 0) state.firstSendMs = performance.now();
+    try {
+      await fm.send({ image: video });
+    } catch (e) {
+      if (fm === state.faceMesh && !state.sendErr) {
+        state.sendErr = e;
+        console.error('[FaceMesh] send failed:', e);
+        showInlineError('[FaceMesh] ' + _safeStr(e));
+      }
     }
+  };
+
+  if (video && typeof video.requestVideoFrameCallback === 'function') {
+    const onFrame = async (_now, meta) => {
+      if (!alive()) return;
+      await handleFrame(meta?.mediaTime * 1000, meta?.presentedFrames);
+      if (alive()) video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+  } else {
+    let lastTime = -1;
+    const tick = async () => {
+      if (!alive()) return;
+      const ct = video ? video.currentTime : NaN;
+      if (video && video.readyState >= 2 && ct !== lastTime) {
+        lastTime = ct;
+        await handleFrame(ct * 1000, NaN);
+      }
+      if (alive()) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  startUiLoop(gen);
+}
+
+function startUiLoop(gen) {
+  if (state.uiRaf) cancelAnimationFrame(state.uiRaf);
+  const frame = () => {
+    state.uiRaf = null;
+    if (gen !== state.loopGen || state.cancelled || state.phase === 'idle') return;
+    const now = performance.now();
     if (state.phase === 'capturing') updateCaptureCountdown();
-    if (state.lastFaceBox &&
-        performance.now() - state.lastFaceMs > FACE_LOST_RETICLE_LOST_MS) {
+    else if (state.phase === 'preflight') updatePreflightFaceHint(now);
+    if (state.phase !== 'idle' && state.lastFaceBox &&
+        now - state.lastFaceMs > FACE_LOST_RETICLE_LOST_MS) {
       drawROIOverlay(state.lastBoxes || {}, null, /*lost=*/true);
     }
-    state.rafCapture = requestAnimationFrame(tick);
+    if (gen === state.loopGen && state.phase !== 'idle') state.uiRaf = requestAnimationFrame(frame);
   };
-  state.rafCapture = requestAnimationFrame(tick);
+  state.uiRaf = requestAnimationFrame(frame);
+}
+
+// During preflight: FaceMesh answers but has not seen a usable face for a while.
+function updatePreflightFaceHint(now) {
+  if (!els.faceHint) return;
+  const lastFace = Math.max(state.faceSeenMs, state.firstResultMs ?? Infinity);
+  const show = state.firstResultMs != null && !state.preflightFail &&
+    now - lastFace > PREFLIGHT_FACE_HINT_MS;
+  els.faceHint.classList.toggle('visible', show);
 }
 
 function updateCaptureCountdown() {
@@ -565,24 +821,23 @@ function updateCaptureCountdown() {
   if (remaining <= 0) finalizeCapture();
 }
 
-function enterCaptureScreen() {
+// live: false for the demo, which drives the ring itself and has no camera.
+function enterCaptureScreen({ live = true } = {}) {
   // Reset sample buffers so the 45 s window doesn't include preflight frames.
   state.samples = [];
   state.samplesByROI = { forehead: [], l_cheek: [], r_cheek: [] };
   state.captureStartMs = performance.now();
   state.cancelled = false;
-  state.liveHrEMA = null;
   state.lastSqi = 0;
   els.faceHint && els.faceHint.classList.remove('visible');
-  setRingProgress(0);
-  els.hrRing && (els.hrRing.textContent = '—');
-  els.sqiPct && (els.sqiPct.textContent = '—');
+  clearLiveReadout();
   els.countdown && (els.countdown.textContent = CAPTURE_SECONDS.toFixed(0));
   state.phase = 'capturing';
 
   state.liveRppg = new LiveRPPG();
+  state.liveGate = new LiveHrGate();
   if (state.liveTimer) { clearInterval(state.liveTimer); state.liveTimer = null; }
-  state.liveTimer = setInterval(runLiveEstimate, 500);
+  if (live) state.liveTimer = setInterval(runLiveEstimate, LIVE_EVERY_MS);
 
   if (state.trace) state.trace.stop();
   state.trace = new HRVTrace(els.hrvCanvas, { bpmDisplayEl: els.bpmValue });
@@ -594,23 +849,41 @@ function enterCaptureScreen() {
   state.trace.start();
 }
 
+// Every LIVE_EVERY_MS during a camera capture. The HR is shown only while
+// the 8 s estimate passes the calibrated quality gate (LiveHrGate); the ring
+// shows that estimate's SQI, and grey while no face is in view or before the
+// first estimate.
 function runLiveEstimate() {
-  if (state.cancelled || !state.liveRppg) return;
-  const { hr, snrDb, bvp } = state.liveRppg.estimate(8);
-  if (state.trace && bvp && bvp.length) state.trace.setBVP(bvp);
-  if (hr != null && snrDb > 3) {
-    state.liveHrEMA = state.liveHrEMA == null ? hr : 0.7 * state.liveHrEMA + 0.3 * hr;
-    if (state.trace) state.trace.setBPM(state.liveHrEMA);
-    els.hrRing.textContent = state.liveHrEMA.toFixed(0);
-    if (state.lastSqi >= SQI_LIVE_THRESHOLD) {
-      if (state.trace) state.trace.setMode('live');
-      if (els.traceModeBadge.dataset.mode !== 'live') {
-        els.traceModeBadge.dataset.mode = 'live';
-        els.traceModeBadge.textContent = 'live';
-      }
-    }
-  } else if (state.liveHrEMA == null) {
-    els.hrRing.textContent = '—';
+  if (state.cancelled || state.phase !== 'capturing' || !state.liveRppg) return;
+  const est = state.liveRppg.estimate(LIVE_WINDOW_SEC);
+  if (state.trace && est.bvp && est.bvp.length) state.trace.setBVP(est.bvp);
+  const faceOk = performance.now() - state.lastFaceMs <= FACE_LOST_HINT_MS;
+
+  if (!faceOk || est.hr == null) {
+    state.lastSqi = 0;
+    setRingIdle();
+  } else {
+    state.lastSqi = state.lastSqi > 0 ? 0.5 * state.lastSqi + 0.5 * est.sqi : est.sqi;
+    setRingProgress(state.lastSqi);
+  }
+
+  const shown = state.liveGate ? state.liveGate.update(est, faceOk) : { hr: null, live: false };
+  state.liveHrEMA = shown.hr;
+  if (shown.hr != null) {
+    if (state.trace) state.trace.setBPM(shown.hr);
+    if (els.hrRing) els.hrRing.textContent = shown.hr.toFixed(0);
+  } else {
+    if (state.trace) state.trace.clearBPM();
+    if (els.hrRing) els.hrRing.textContent = NO_VALUE;
+  }
+  setTraceMode(shown.live ? 'live' : 'preview');
+}
+
+function setTraceMode(mode) {
+  if (state.trace) state.trace.setMode(mode);
+  if (els.traceModeBadge && els.traceModeBadge.dataset.mode !== mode) {
+    els.traceModeBadge.dataset.mode = mode;
+    els.traceModeBadge.textContent = mode;
   }
 }
 
@@ -623,7 +896,12 @@ function extractROIMean(lm, idxs, w, h, ctx) {
   const y1 = Math.min(h, Math.ceil(Math.max(...ys)));
   const rw = x1 - x0, rh = y1 - y0;
   if (rw < 6 || rh < 6) return null;
-  els.roiCanvas.width = rw; els.roiCanvas.height = rh;
+  // Grow the scratch canvas only when needed; resizing reallocates it.
+  const c = els.roiCanvas;
+  if (c.width < rw || c.height < rh) {
+    c.width = Math.max(c.width, rw);
+    c.height = Math.max(c.height, rh);
+  }
   ctx.drawImage(els.video, x0, y0, rw, rh, 0, 0, rw, rh);
   const data = ctx.getImageData(0, 0, rw, rh).data;
   let sr = 0, sg = 0, sb = 0, np = 0;
@@ -645,12 +923,24 @@ function computeFaceBBox(boxes, w, h) {
 }
 
 function onFaceResults(results) {
+  // Any result, face or not, shows the model is running (preflight checks).
+  let firstResult = false;
+  if (state.firstResultMs == null) {
+    state.firstResultMs = performance.now();
+    firstResult = true;
+    // The first send() of a FaceMesh instance also downloads and starts the
+    // model (several seconds on a cold cache), so this result belongs to a
+    // frame taken before that wait. Start the preflight window here and leave
+    // this frame out; otherwise the frame-rate check averages over the load.
+    if (state.phase === 'preflight' && state.preflight) state.preflight.start();
+  }
   const lm = results.multiFaceLandmarks && results.multiFaceLandmarks[0];
   if (!lm) return;
   state.lastFaceMs = performance.now();
   const w = els.video.videoWidth || 640;
   const h = els.video.videoHeight || 480;
-  const ctx = els.roiCanvas.getContext('2d', { willReadFrequently: true });
+  if (!state.roiCtx) state.roiCtx = els.roiCanvas.getContext('2d', { willReadFrequently: true });
+  const ctx = state.roiCtx;
 
   const samples = {};
   const boxes = {};
@@ -661,8 +951,11 @@ function onFaceResults(results) {
     boxes[def.key] = out.box;
   }
   if (!Object.keys(samples).length) return;
+  state.faceSeenMs = state.lastFaceMs;
 
-  const t = state.lastFaceMs;
+  // Camera frame time of the frame FaceMesh just analysed (set by the frame
+  // loop before send()), so the rPPG timing follows the camera, not the loop.
+  const t = state.frameT;
   for (const def of ROI_DEFS) {
     const s = samples[def.key];
     if (!s) continue;
@@ -673,13 +966,12 @@ function onFaceResults(results) {
   state.lastFaceBox = computeFaceBBox(boxes, w, h);
 
   // Phase 6 preflight tap-off (only during the 3 s warm-up).
-  if (state.phase === 'preflight' && state.preflight && !state.preflight.done) {
+  if (!firstResult && state.phase === 'preflight' && state.preflight && !state.preflight.done) {
     state.preflight.observe(boxes, w, h, els.video, t);
   }
 
   const quality = state.liveRppg ? state.liveRppg.getPerROIQuality() : null;
   drawROIOverlay(boxes, quality, /*lost=*/false);
-  if (state.phase === 'capturing') updateSqiRingLive();
 }
 
 function drawROIOverlay(boxes, quality, lost) {
@@ -745,51 +1037,6 @@ function drawROIOverlay(boxes, quality, lost) {
   }
 }
 
-function updateLiveHr() {
-  if (state.samples.length < 60) return;
-  const last = state.samples.slice(-Math.min(state.samples.length, 240));
-  const ts = last.map((x) => x[3] / 1000);
-  const gs = last.map((x) => x[1]);
-  const mean = gs.reduce((a, c) => a + c, 0) / gs.length;
-  const centred = gs.map((v) => v - mean);
-  let zc = 0;
-  for (let i = 1; i < centred.length; i++) {
-    if ((centred[i - 1] >= 0) !== (centred[i] >= 0)) zc++;
-  }
-  const span = ts[ts.length - 1] - ts[0];
-  if (span <= 0) return;
-  const bpm = (zc / (2 * span)) * 60;
-  if (bpm < 40 || bpm > 200) return;
-  state.liveHrEMA = state.liveHrEMA == null ? bpm : 0.7 * state.liveHrEMA + 0.3 * bpm;
-  els.hrRing.textContent = state.liveHrEMA.toFixed(0);
-  if (state.trace) {
-    state.trace.setBPM(state.liveHrEMA);
-    // Live mode once we have a stable estimate + SQI is reasonable.
-    if (state.lastSqi >= SQI_LIVE_THRESHOLD) {
-      state.trace.setMode('live');
-      if (els.traceModeBadge.dataset.mode !== 'live') {
-        els.traceModeBadge.dataset.mode = 'live';
-        els.traceModeBadge.textContent = 'live';
-      }
-    }
-  }
-}
-
-function updateSqiRingLive() {
-  // Live SQI proxy: blend face-presence with rPPG live SNR (when available).
-  const ago = performance.now() - state.lastFaceMs;
-  const faceQ = Math.max(0, 1 - ago / 1500);
-  const elapsed = (performance.now() - state.captureStartMs) / 1000;
-  const ramp = Math.min(1, elapsed / 8);
-  let snrQ = 0;
-  if (state.liveRppg && state.liveRppg.lastSNR) {
-    snrQ = Math.max(0, Math.min(1, state.liveRppg.lastSNR / 10));
-  }
-  const sqi = Math.min(0.95, 0.4 * faceQ + 0.3 * ramp + 0.3 * snrQ);
-  state.lastSqi = 0.7 * state.lastSqi + 0.3 * sqi;
-  setRingProgress(state.lastSqi);
-}
-
 function setRingProgress(ratio01) {
   const r = Math.max(0, Math.min(1, ratio01));
   const off = SQI_RING_CIRC * (1 - r);
@@ -802,6 +1049,15 @@ function setRingProgress(ratio01) {
   els.sqiPct.textContent = `${Math.round(r * 100)}%`;
 }
 
+// No face or no estimate yet: grey, empty ring and no percentage.
+function setRingIdle() {
+  if (els.ringFg) {
+    els.ringFg.setAttribute('stroke-dashoffset', SQI_RING_CIRC.toFixed(2));
+    els.ringFg.style.stroke = getCSS('--st-text-tertiary');
+  }
+  if (els.sqiPct) els.sqiPct.textContent = NO_VALUE;
+}
+
 function stopStream() {
   if (state.stream) for (const t of state.stream.getTracks()) t.stop();
   state.stream = null;
@@ -809,8 +1065,9 @@ function stopStream() {
 
 function cleanupCaptureResources() {
   try {
-    if (state.rafCapture) cancelAnimationFrame(state.rafCapture);
-    state.rafCapture = null;
+    state.loopGen++;   // stops the camera frame loop and the UI loop
+    if (state.uiRaf) cancelAnimationFrame(state.uiRaf);
+    state.uiRaf = null;
     if (state.liveTimer) { clearInterval(state.liveTimer); state.liveTimer = null; }
     if (state.trace && state.trace.stop) state.trace.stop();
     stopStream();
@@ -820,6 +1077,7 @@ function cleanupCaptureResources() {
 
 // User-initiated cancel only: explicit return to intro is fine here.
 function abortCapture(msg) {
+  state.runId++;   // a running demo tick or a late backend reply sees this and stops
   state.cancelled = true;
   state.phase = 'idle';
   cleanupCaptureResources();
@@ -834,6 +1092,7 @@ function abortCapture(msg) {
 // with an inline error. Never bounces back to intro on its own — per the iOS
 // hotfix policy, only explicit user buttons may return to the intro screen.
 function endCaptureWithError(msg) {
+  state.runId++;
   state.cancelled = true;
   state.phase = 'idle';
   cleanupCaptureResources();
@@ -853,6 +1112,8 @@ async function finalizeCapture() {
   if (state.phase !== 'capturing') return;
   state.phase = 'idle';
   state.cancelled = true;
+  const runId = state.runId;
+  const liveRppg = state.liveRppg;
 
   // 1. Release camera/timers/raf first — relieve iOS Safari memory pressure
   //    before we do any heavier computation.
@@ -865,14 +1126,15 @@ async function finalizeCapture() {
   //    reachable, only enriches it. Either step can fail without unwinding.
   let result = null;
   try {
-    if (state.liveRppg) {
-      const live = state.liveRppg.estimate(CAPTURE_SECONDS);
-      if (state.liveRppg.lastCombinedBvp && state.liveRppg.lastCombinedBvp.length) {
-        state.bvpForSpark = state.liveRppg.lastCombinedBvp;
+    if (liveRppg) {
+      // Whole capture (up to 45 s), same harmonic SNR and SQI scale as live.
+      const live = liveRppg.estimate(CAPTURE_SECONDS);
+      if (liveRppg.lastCombinedBvp && liveRppg.lastCombinedBvp.length) {
+        state.bvpForSpark = liveRppg.lastCombinedBvp;
       }
       result = {
         hr_bpm: live.hr,
-        sqi: clamp((live.snrDb || 0) / 12, 0, 1),
+        sqi: live.sqi,
         snr_db: live.snrDb,
         rmssd_ms: null, sdnn_ms: null, sd1_ms: null, sd2_ms: null,
         ans_state: 'uncertain',
@@ -907,6 +1169,9 @@ async function finalizeCapture() {
     showInlineError('계산 중 오류: ' + (e.message || e));
   }
 
+  // A new run started while the backend was answering: leave its screen alone.
+  if (runId !== state.runId) return;
+
   // 4. Render — placeholder if nothing usable. renderResult is also wrapped
   //    in its own try so an exception inside the render path can't unwind.
   try {
@@ -920,8 +1185,8 @@ async function finalizeCapture() {
   //    done with them. iOS Safari kills tabs that hold too much.
   state.samples = [];
   state.samplesByROI = { forehead: [], l_cheek: [], r_cheek: [] };
-  if (state.liveRppg && state.liveRppg.samples) {
-    state.liveRppg.samples = { forehead: [], l_cheek: [], r_cheek: [] };
+  if (liveRppg && liveRppg.samples) {
+    liveRppg.samples = { forehead: [], l_cheek: [], r_cheek: [] };
   }
 
   if (els.btnStart) els.btnStart.disabled = false;
@@ -949,7 +1214,7 @@ function buildMultiROIPayload() {
 
 // Demo mode still uses postProcess (it never has live rPPG data to fall back
 // on). On failure, paint a placeholder rather than bouncing to intro.
-async function postProcess(payload) {
+async function postProcess(payload, runId = state.runId) {
   if (!API_BASE) {
     // Hosted build with no backend — demo can't actually compute, just show
     // a placeholder so the UI still leads somewhere.
@@ -967,15 +1232,17 @@ async function postProcess(payload) {
     }, 5000);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const result = await resp.json();
+    if (runId !== state.runId) return;   // cancelled or a new run started meanwhile
     show(els.resultScreen);
     try { renderResult(result); }
     catch (e) { showInlineError('결과 표시 중 오류: ' + (e.message || e)); }
   } catch (e) {
+    if (runId !== state.runId) return;
     show(els.resultScreen);
     try { renderResult(makePlaceholderResult()); } catch {}
     showInlineError(`서버 오류: ${e.message || e}`);
   } finally {
-    if (els.btnStart) els.btnStart.disabled = false;
+    if (runId === state.runId && els.btnStart) els.btnStart.disabled = false;
   }
 }
 
@@ -986,21 +1253,26 @@ function renderResult(r) {
     show(els.resultScreen);
     // Demo mode: paint over weak SQI so executives never see the warning chip.
     if (state.demoMode) r = { ...r, sqi: Math.max(r.sqi || 0, 0.85) };
+    // Same SQI scale and threshold as the live gate. An in-browser HR that
+    // failed the gate is not shown (it is the strongest peak of noise).
+    const gate = qualityGate(r.sqi, r.source);
 
-    if (els.mHr)    els.mHr.textContent    = fmt(r.hr_bpm, 1);
+    if (els.mHr)    els.mHr.textContent    = gate.showHr ? fmt(r.hr_bpm, 1) : NO_VALUE;
     if (els.mRmssd) els.mRmssd.textContent = fmt(r.rmssd_ms, 1);
     if (els.mSdnn)  els.mSdnn.textContent  = fmt(r.sdnn_ms, 1);
     if (els.mSd1)   els.mSd1.textContent   = fmt(r.sd1_ms, 1);
     if (els.mSd2)   els.mSd2.textContent   = fmt(r.sd2_ms, 1);
     if (els.mSqi)   els.mSqi.textContent   = fmt(r.sqi, 2);
 
-    // Phase 5 — low-quality warning chip in the 0.35–0.55 window.
+    // Low-quality chip: any SQI above 0 that does not reach SQI_PASS.
     const qChip = document.getElementById('quality-chip');
     if (qChip) {
-      const sqi = r.sqi || 0;
-      if (sqi >= 0.35 && sqi < 0.55) {
+      if (gate.showChip) {
+        const pct = (r.sqi * 100).toFixed(0);
         qChip.hidden = false;
-        qChip.textContent = `신호 품질 낮음 (SQI ${(sqi * 100).toFixed(0)}%) — 결과는 참고용`;
+        qChip.textContent = gate.showHr
+          ? `신호 품질 낮음 (SQI ${pct}%). 결과는 참고용입니다.`
+          : `신호 품질 낮음 (SQI ${pct}%). 심박수를 표시하지 않습니다.`;
       } else {
         qChip.hidden = true;
       }
@@ -1021,9 +1293,10 @@ function renderResult(r) {
     if (els.gaugePoint) animateGaugePoint(targetX, targetY, color);
 
     // Rationale: show always in demo mode, otherwise only if SQI is decent.
-    const showRationale = state.demoMode || (r.sqi || 0) >= 0.6;
+    // Hidden again otherwise, so a card from an earlier run does not linger.
+    const showRationale = state.demoMode || gate.pass;
+    if (els.rationale) els.rationale.hidden = !showRationale;
     if (showRationale && els.rationale) {
-      els.rationale.hidden = false;
       if (els.rHr)    els.rHr.textContent    = fmt(r.hr_bpm, 0);
       if (els.rRmssd) els.rRmssd.textContent = fmt(r.rmssd_ms, 0);
       if (els.rAnsLabel) els.rAnsLabel.textContent = kor.title;
@@ -1045,9 +1318,8 @@ function renderResult(r) {
         els.fallback.hidden = true;
         els.btnSound.disabled = false;
       } else {
-        const okSqi = (r.sqi || 0) >= 0.6;
-        els.fallback.hidden = okSqi;
-        els.btnSound.disabled = !okSqi;
+        els.fallback.hidden = gate.pass;
+        els.btnSound.disabled = !gate.pass;
       }
     }
 
@@ -1123,11 +1395,14 @@ function drawSparkline(buf) {
 // ───────────────────────── demo capture ─────────────────────────
 function runDemoCapture() {
   const target = nextDemoState();
+  // Cancel (abortCapture) or a new start bumps state.runId; the tick below
+  // then stops instead of taking over the screen 45 s later.
+  const runId = state.runId;
   // Demo bypasses preflight: show capture screen with chrome visible directly.
   show(els.captureScreen);
   showPreflightPanel(false);
   showCaptureChrome(true);
-  enterCaptureScreen();
+  enterCaptureScreen({ live: false });
   state.lastFaceMs = performance.now();
   const { rgb, fs } = buildDemoRgb(target);
   state.samples = rgb.map((c, i) => [c[0], c[1], c[2],
@@ -1141,6 +1416,7 @@ function runDemoCapture() {
   // 'uncertain' demo stays in preview mode (signal genuinely poor).
   const willGoLive = target !== 'uncertain';
   function tick() {
+    if (state.runId !== runId || state.cancelled) return;
     const elapsed = performance.now() - t0;
     const remaining = CAPTURE_SECONDS - elapsed / 1000;
     els.countdown.textContent = Math.max(0, remaining).toFixed(1);
@@ -1161,8 +1437,10 @@ function runDemoCapture() {
       }
     }
     if (elapsed >= totalMs) {
+      state.phase = 'idle';
+      if (state.liveTimer) { clearInterval(state.liveTimer); state.liveTimer = null; }
       if (state.trace) state.trace.stop();
-      postProcess({ rgb: rgb.map((c) => [c[0], c[1], c[2]]), fps: fs });
+      postProcess({ rgb: rgb.map((c) => [c[0], c[1], c[2]]), fps: fs }, runId);
       return;
     }
     requestAnimationFrame(tick);
@@ -1173,6 +1451,7 @@ function runDemoCapture() {
 // ───────────────────────── sound playback ─────────────────────────
 async function onSoundClicked() {
   const r = window.__bellResult; if (!r) return;
+  if (state.soundPlaying) return;
   show(els.soundScreen);
   els.btnSound.disabled = true;
   const ansState = r.ans_state || 'uncertain';
@@ -1182,11 +1461,19 @@ async function onSoundClicked() {
   els.soundProfileName.textContent = cfg.rationale;
   els.feedbackRow.hidden = true;
   els.btnFinish.hidden = true;
+  if (els.soundControls) els.soundControls.hidden = false;
+  if (els.soundVolume) els.soundVolume.value = String(state.volume);
   els.breathingText.textContent = '시작합니다';
+  els.soundTimer.textContent = '01:00';
+  state.soundPlaying = true;
+  state.soundStopRequested = false;
   state.soundTimerStart = performance.now();
 
+  let started = false;
   try {
-    await state.engine.playForState(ansState, {
+    if (!state.engine) throw new Error('오디오 엔진을 만들지 못했습니다.');
+    state.engine.setMasterGain(state.volume);
+    started = await state.engine.playForState(ansState, {
       bpmHint: 6,
       onMissing: ({ requested, used }) => {
         toast(used ? `사운드 대체: ${requested} → ${used}` : `사운드 누락: ${requested}`);
@@ -1200,9 +1487,19 @@ async function onSoundClicked() {
   } catch (e) {
     console.error(e);
     toast(`사운드 오류: ${e.message}`);
-    els.btnSound.disabled = false;
+    endSoundScreen('사운드를 재생하지 못했습니다', { feedback: false });
     return;
   }
+  if (started === false) {
+    endSoundScreen('사운드 파일을 불러오지 못했습니다', { feedback: false });
+    return;
+  }
+  if (state.soundStopRequested) {
+    // Stop was pressed while playback was starting.
+    state.engine.stop({ fadeMs: 300 });
+    return;
+  }
+  state.engine.setMasterGain(state.volume);
 
   // Drive audio-vis + 60s countdown via rAF.
   startSoundFrameLoop();
@@ -1212,6 +1509,7 @@ const PLAY_DURATION_S = 60;
 function startSoundFrameLoop() {
   cancelAnimationFrame(state.soundRaf);
   function frame() {
+    if (!state.soundPlaying) return;
     const elapsed = (performance.now() - state.soundTimerStart) / 1000;
     const remaining = Math.max(0, PLAY_DURATION_S - elapsed);
     const mm = Math.floor(remaining / 60).toString().padStart(2, '0');
@@ -1228,13 +1526,37 @@ function startSoundFrameLoop() {
   state.soundRaf = requestAnimationFrame(frame);
 }
 
+// End of playback: timer ran out or the stop button. Safe to call twice.
 function finishSoundPlayback() {
+  if (!state.soundPlaying) return;
+  try { state.engine?.stop({ fadeMs: 1200 }); } catch (e) { console.error('[sound] stop', e); }
+  endSoundScreen('마쳤어요');
+}
+
+function onSoundStopClicked() {
+  if (!state.soundPlaying) return;
+  state.soundStopRequested = true;
+  finishSoundPlayback();
+}
+
+// Playback is over: hide stop and volume, offer rating (only after real
+// playback) and the way back.
+function endSoundScreen(text, { feedback = true } = {}) {
+  state.soundPlaying = false;
   cancelAnimationFrame(state.soundRaf);
-  state.engine.stop({ fadeMs: 1200 });
+  state.soundRaf = null;
   els.breathingOrb.classList.remove('peak');
-  els.breathingText.textContent = '마쳤어요';
-  els.feedbackRow.hidden = false;
+  els.breathingText.textContent = text;
+  if (els.soundControls) els.soundControls.hidden = true;
+  els.feedbackRow.hidden = !feedback;
   els.btnFinish.hidden = false;
+}
+
+function onVolumeInput() {
+  const v = Number(els.soundVolume?.value);
+  if (!Number.isFinite(v)) return;
+  state.volume = clamp(v, 0, MAX_VOLUME);
+  state.engine?.setMasterGain(state.volume);
 }
 
 function drawAudioVis(data) {
@@ -1286,21 +1608,20 @@ function initDom() {
   });
 
   els.btnStart?.addEventListener('click', onStartClicked);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   els.btnCancel?.addEventListener('click', () => abortCapture('측정을 중단했어요.'));
-  els.btnPreflightRetry?.addEventListener('click', () => {
-    if (els.preflightRetryRow) els.preflightRetryRow.hidden = true;
-    enterPreflightPhase();
-    pollPreflight();
-  });
+  els.btnPreflightRetry?.addEventListener('click', retryPreflight);
   els.btnPreflightSkip?.addEventListener('click', () => {
     if (els.preflightRetryRow) els.preflightRetryRow.hidden = true;
-    transitionToCapture();
+    if (state.phase === 'preflight') transitionToCapture();
   });
   els.btnRetry?.addEventListener('click', () => {
     show(els.introScreen);
     if (els.btnStart) els.btnStart.disabled = false;
   });
   els.btnSound?.addEventListener('click', onSoundClicked);
+  els.btnSoundStop?.addEventListener('click', onSoundStopClicked);
+  els.soundVolume?.addEventListener('input', onVolumeInput);
   els.btnFinish?.addEventListener('click', () => {
     show(els.introScreen);
     if (els.btnStart) els.btnStart.disabled = false;
@@ -1314,7 +1635,7 @@ function initDom() {
     console.log('[feedback]', { state: window.__bellResult?.ans_state, fb: btn.dataset.fb });
   });
 
-  console.info('[SleepThera] main.js v6.4-pages wired (' + Object.keys(ELS_BINDINGS).length +
+  console.info('[SleepThera] main.js v6.5-pages wired (' + Object.keys(ELS_BINDINGS).length +
                ' bindings, ' + missing.length + ' missing)');
 }
 

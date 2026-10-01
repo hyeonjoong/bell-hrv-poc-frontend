@@ -1,11 +1,28 @@
-/* Phase 6 — shared DSP helpers (IIR bandpass + DFT peak finder).
+/* Shared DSP helpers: 30 Hz bandpass, filtfilt and the DFT peak finder.
  *
- * The Butterworth coefficients are precomputed for fs = 30 Hz, 0.7–4 Hz,
- * 4th order. Webcams that report fps in [27, 33] use these as-is (small
- * passband shift, acceptable for the live preview). Outside that range
- * computeBPFCoeffs falls back to the fs=30 coeffs with a console.warn.
- * Authoritative HR/HRV still comes from the backend on finalize, where
- * scipy.signal.butter is recomputed for the actual fs.
+ * Sampling rate: LiveRPPG (rppg_live.js) resamples every ROI stream onto a
+ * uniform 30 Hz grid before filtering, so the fixed fs = 30 Hz coefficients
+ * below are the right ones whatever the camera or FaceMesh loop rate is.
+ * computeBPFCoeffs is kept for callers that still pass an fs; it has no
+ * coefficients for any other rate and warns once if asked for one.
+ *
+ * fftPeakBpm(x, fs) returns
+ *   hrBpm  frequency of the largest spectral peak in [loHz, hiHz], in bpm.
+ *   snrDb  harmonic-band SNR: power within HARMONIC_HALF_WIDTH_HZ of the peak
+ *          and of its second harmonic (when that is below fs/2 minus
+ *          NYQUIST_MARGIN_HZ), over the remaining power between loHz and
+ *          min(2 * hiHz, fs/2 - NYQUIST_MARGIN_HZ). A clean pulse gives a
+ *          positive value, broadband noise a negative one. It replaced a peak
+ *          over median ratio that was several dB even for pure noise.
+ *          NO_SNR_DB when the input is too short or flat to analyse.
+ *   snrWideDb  the same ratio with a wider signal band: WIDE_HALF_WIDTH_HZ
+ *          around the peak and twice that around the second harmonic. When
+ *          the heart rate swings during the window (for example with slow
+ *          breathing), a long window resolves the swing into sidebands
+ *          around f0 and 2 f0 (twice as far out at 2 f0). The narrow band
+ *          then counts them as noise; the wide band keeps them. A weak but
+ *          steady pulse scores better on the narrow band, so rppg_live.js
+ *          calibrates both and uses the better one.
  */
 
 // 4th-order Butterworth bandpass for fs=30 Hz, 0.7–4 Hz.
@@ -23,18 +40,21 @@ export const BPF30_A = [
 
 let _warnedFs = false;
 export function computeBPFCoeffs(fs /* , lo=0.7, hi=4.0, order=4 */) {
-  if (Math.abs(fs - 30) > 3 && !_warnedFs) {
-    console.warn(`[dsp] webcam fs=${fs.toFixed(1)}Hz deviates from 30Hz — passband shifted; backend remains authoritative.`);
+  if (Math.abs(fs - 30) > 0.5 && !_warnedFs) {
+    console.warn(`[dsp] only fs=30 Hz bandpass coefficients exist (asked for ${Number(fs).toFixed(1)} Hz); resample to 30 Hz first.`);
     _warnedFs = true;
   }
   return { b: BPF30_B, a: BPF30_A };
 }
 
-/** Causal IIR — direct form II transposed. */
+/** Causal IIR, direct form II transposed. The state is kept in float64:
+ *  the 0.7 Hz poles sit close to the unit circle, and with float32 state
+ *  the output was 0.14 % (lfilter) and 0.25 % (filtfilt) off scipy on the
+ *  reference signal in test/fixtures. */
 export function applyIIR(x, b, a) {
   const N = x.length;
   const order = Math.max(b.length, a.length) - 1;
-  const z = new Float32Array(order);
+  const z = new Float64Array(order);
   const y = new Float32Array(N);
   const a0 = a[0] || 1;
   for (let n = 0; n < N; n++) {
@@ -62,11 +82,18 @@ export function filtfilt(x, b, a) {
   return out;
 }
 
-/** Zero-padded DFT with Hann window → peak in [loHz, hiHz]. */
+export const HARMONIC_HALF_WIDTH_HZ = 0.1;
+export const WIDE_HALF_WIDTH_HZ = 0.15;
+export const NYQUIST_MARGIN_HZ = 0.5;
+export const NO_SNR_DB = -99;
+
+/** Zero-padded DFT with Hann window: peak in [loHz, hiHz] and harmonic SNR
+ *  (narrow and wide signal band, see the header). */
 export function fftPeakBpm(x, fs, loHz = 0.7, hiHz = 3.5) {
   const N = x.length;
-  if (N < 16) return { hrBpm: null, snrDb: 0 };
-  const w = new Float32Array(N);
+  const none = { hrBpm: null, snrDb: NO_SNR_DB, snrWideDb: NO_SNR_DB };
+  if (N < 16 || !(fs > 0)) return none;
+  const w = new Float64Array(N);
   for (let i = 0; i < N; i++) {
     w[i] = x[i] * 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
   }
@@ -74,27 +101,53 @@ export function fftPeakBpm(x, fs, loHz = 0.7, hiHz = 3.5) {
   while (Nz < N * 4) Nz <<= 1;
   Nz = Math.max(256, Math.min(2048, Nz));
   const df = fs / Nz;
+  const kNyq = Math.floor(Nz / 2);
   const kLo = Math.max(1, Math.floor(loHz / df));
-  const kHi = Math.min(Math.floor(Nz / 2), Math.ceil(hiHz / df));
-  if (kHi <= kLo) return { hrBpm: null, snrDb: 0 };
-  const power = new Float32Array(kHi - kLo + 1);
-  for (let k = kLo; k <= kHi; k++) {
-    let re = 0, im = 0;
-    const c = (-2 * Math.PI * k) / Nz;
+  const kHi = Math.min(kNyq, Math.ceil(hiHz / df));
+  if (kHi <= kLo) return none;
+  // The SNR reference band reaches up to the second harmonic of hiHz.
+  const usableHz = fs / 2 - NYQUIST_MARGIN_HZ;
+  const kTop = Math.max(kHi, Math.min(kNyq, Math.floor(Math.min(2 * hiHz, usableHz) / df)));
+
+  // DFT bins kLo..kTop; the twiddle factor is advanced by rotation instead of
+  // calling cos/sin for every sample.
+  const power = new Float64Array(kTop - kLo + 1);
+  for (let k = kLo; k <= kTop; k++) {
+    const theta = (-2 * Math.PI * k) / Nz;
+    const cs = Math.cos(theta), sn = Math.sin(theta);
+    let c = 1, s = 0, re = 0, im = 0;
     for (let n = 0; n < N; n++) {
       const wn = w[n];
-      re += wn * Math.cos(c * n);
-      im += wn * Math.sin(c * n);
+      re += wn * c;
+      im += wn * s;
+      const c2 = c * cs - s * sn;
+      s = c * sn + s * cs;
+      c = c2;
     }
     power[k - kLo] = re * re + im * im;
   }
-  let bestK = 0, bestP = 0;
-  for (let i = 0; i < power.length; i++) {
-    if (power[i] > bestP) { bestP = power[i]; bestK = i; }
+
+  let bestK = -1, bestP = 0;
+  for (let k = kLo; k <= kHi; k++) {
+    const p = power[k - kLo];
+    if (p > bestP) { bestP = p; bestK = k; }
   }
-  const sorted = Array.from(power).sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)] || 1e-9;
-  const snrDb = bestP > 0 ? 10 * Math.log10(bestP / median) : 0;
-  const peakHz = (kLo + bestK) * df;
-  return { hrBpm: peakHz * 60, snrDb };
+  if (bestK < 0) return none;
+  const f0 = bestK * df;
+  const bandSnrDb = (hw0, hw2) => {
+    const withHarmonic = 2 * f0 + hw2 <= usableHz;
+    let sig = 0, rest = 0;
+    for (let k = kLo; k <= kTop; k++) {
+      const f = k * df;
+      const inBand = Math.abs(f - f0) <= hw0 ||
+        (withHarmonic && Math.abs(f - 2 * f0) <= hw2);
+      if (inBand) sig += power[k - kLo]; else rest += power[k - kLo];
+    }
+    return rest > 0 ? 10 * Math.log10(sig / rest) : -NO_SNR_DB;
+  };
+  return {
+    hrBpm: f0 * 60,
+    snrDb: bandSnrDb(HARMONIC_HALF_WIDTH_HZ, HARMONIC_HALF_WIDTH_HZ),
+    snrWideDb: bandSnrDb(WIDE_HALF_WIDTH_HZ, 2 * WIDE_HALF_WIDTH_HZ),
+  };
 }

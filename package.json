@@ -1,0 +1,9 @@
+{
+  "name": "bell-hrv-poc-frontend",
+  "private": true,
+  "type": "module",
+  "description": "Static camera rPPG preview. No runtime or dev dependencies; tests use node:test.",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
